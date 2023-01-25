@@ -19,7 +19,8 @@ from pathlib import Path
 
 import cv2
 import torch
-import torch.backends.cudnn as cudnn
+# import torch.backends.cudnn as cudnn
+import time
 import matplotlib.pyplot as plt
 import numpy as np
 from openvino.runtime import Core
@@ -34,13 +35,118 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from models.common import DetectMultiBackend
 from utils.datasets import IMG_FORMATS, VID_FORMATS, LoadImages, LoadStreams
 from utils.general import (LOGGER, check_file, check_img_size, check_imshow, check_requirements, colorstr,
-                           increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xyxy2xywh)
+                           increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xyxy2xywh, xywh2xyxy)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, time_sync
 
+def non_max_suppression_numpy(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
+                        labels=(), max_det=300):
+    """Runs Non-Maximum Suppression (NMS) on inference results
 
-@torch.no_grad()
-def run(weights=ROOT / 'yolov3.pt',  # model.pt path(s)
+    Returns:
+         list of detections, on (n,6) tensor per image [xyxy, conf, cls]
+    """
+
+    nc = prediction.shape[2] - 5  # number of classes
+    xc = prediction[..., 4] > conf_thres  # candidates
+
+    # Checks
+    assert 0 <= conf_thres <= 1, f'Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0'
+    assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
+
+    # Settings
+    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+    time_limit = 10.0  # seconds to quit after
+    redundant = True  # require redundant detections
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+    merge = False  # use merge-NMS
+
+    t = time.time()
+    LOGGER.info(f'prediction.shape[0]={prediction.shape[0]}')
+    output = [np.zeros([0, 6], dtype=np.float32)] * prediction.shape[0]
+    LOGGER.info(f'output = {output}\noutput.shape={output[0].shape}')
+    LOGGER.info(f'output.dtype = {output[0].dtype}')
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        x = x[xc[xi]]  # confidence
+        LOGGER.info(f'x={x}\nxi={xi}')
+
+        # Cat apriori labels if autolabelling
+        if labels and len(labels[xi]):
+            l = labels[xi]
+            v = torch.zeros((len(l), nc + 5), device=x.device)
+            v[:, :4] = l[:, 1:5]  # box
+            v[:, 4] = 1.0  # conf
+            v[range(len(l)), l[:, 0].long() + 5] = 1.0  # cls
+            x = torch.cat((x, v), 0)
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Compute conf
+        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+        box = xywh2xyxy(x[:, :4])
+        LOGGER.info(f'x = {x}')
+
+        # Detections matrix nx6 (xyxy, conf, cls)
+        if multi_label:
+            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
+        else:  # best class only
+            if xi==0:
+                LOGGER.info(f'x[:, 5:]={x[:, 5:].shape}')
+            conf, j = x[:, 5:].max(1)
+            if xi==0:
+                LOGGER.info(f'x[:,5:]={x[:, 5:].shape}')
+                #LOGGER.info(f'x[:,5:].max(1, keepdim=True)={x[:, 5:].max(1, keepdim=True)}')
+                LOGGER.info(f'conf = {conf.shape}')
+                LOGGER.info(f'j = {j.shape}')
+                LOGGER.info(f'x.shape={x.shape}')
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes is not None:
+            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Apply finite constraint
+        # if not torch.isfinite(x).all():
+        #     x = x[torch.isfinite(x).all(1)]
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            continue
+        elif n > max_nms:  # excess boxes
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence
+
+        # Batched NMS
+        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
+        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        if i.shape[0] > max_det:  # limit detections
+            i = i[:max_det]
+        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
+            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
+            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
+            weights = iou * scores[None]  # box weights
+            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
+            if redundant:
+                i = i[iou.sum(1) > 1]  # require redundancy
+
+        output[xi] = x[i]
+        if (time.time() - t) > time_limit:
+            print(f'WARNING: NMS time limit {time_limit}s exceeded')
+            break  # time limit exceeded
+
+    return output
+# @torch.no_grad()
+def run(originweights=ROOT / 'yolov3.pt', 
+        weights=ROOT / 'yolov3.pt',  # model.pt path(s)
         source=ROOT / 'data/images',  # file/dir/URL/glob, 0 for webcam
         imgsz=640,  # inference size (pixels)
         conf_thres=0.25,  # confidence threshold
@@ -78,21 +184,24 @@ def run(weights=ROOT / 'yolov3.pt',  # model.pt path(s)
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
+
+    model = DetectMultiBackend(originweights)
+    stride, names, pt, jit, onnx = model.stride, model.names, model.pt, model.jit, model.onnx
     # Load model
     ie = Core()
-    LOGGER.info(weights)
-    model = ie.read_model(model=os.path.join(os.getcwd(),weights))
+    #LOGGER.info(weights)
+    model = ie.read_model(weights)
     compiled_model = ie.compile_model(model=model, device_name=device)
-    LOGGER.info(f'compiled_model.input(0) = {compiled_model.input(0)}\n any_name = {compiled_model.input(0).any_name}')
-    LOGGER.info(f'compiled_model.output(0) = {compiled_model.output(0)}\n any_name = {compiled_model.output(0).any_name}')
+    #LOGGER.info(f'compiled_model.input(0) = {compiled_model.input(0)}\n any_name = {compiled_model.input(0).any_name}')
+    #LOGGER.info(f'compiled_model.output(0) = {compiled_model.output(0)}\n any_name = {compiled_model.output(0).any_name}')
     input_layer_ir = compiled_model.input(0)
     N, C, H, W = input_layer_ir.shape
-    print(N, C, H, W)
+    #print(N, C, H, W)
     output_layer_ir = compiled_model.output("output")
-    stride = 32
-    pt = True
-    jit = False
-    LOGGER.info(input_layer_ir)
+    # stride = 32
+    # pt = True
+    # jit = False
+    #LOGGER.info(input_layer_ir)
     # device = select_device(device)
     # model = DetectMultiBackend(weights, device=device, dnn=dnn)
     # stride, names, pt, jit, onnx = model.stride, model.names, model.pt, model.jit, model.onnx
@@ -101,7 +210,7 @@ def run(weights=ROOT / 'yolov3.pt',  # model.pt path(s)
     # Dataloader
     if webcam:
         view_img = check_imshow()
-        cudnn.benchmark = True  # set True to speed up constant image size inference
+        # cudnn.benchmark = True  # set True to speed up constant image size inference
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt and not jit)
         bs = len(dataset)  # batch_size
     else:
@@ -115,10 +224,10 @@ def run(weights=ROOT / 'yolov3.pt',  # model.pt path(s)
     dt, seen = [0.0, 0.0, 0.0], 0
     for path, im, im0s, vid_cap, s in dataset:
         t1 = time_sync()
-        LOGGER.info(f'im.shape = {im.shape}')
+        #LOGGER.info(f'im.shape = {im.shape}')
         im = np.swapaxes(im, 1, 2)
         im = np.swapaxes(im, 0, 2)
-        LOGGER.info(f'im after swap the axes = {im.shape}')
+        #LOGGER.info(f'im after swap the axes = {im.shape}')
         im = cv2.resize(im, (W, H))
         im = np.swapaxes(im, 0, 2)
         im = np.swapaxes(im, 1, 2)
@@ -126,18 +235,19 @@ def run(weights=ROOT / 'yolov3.pt',  # model.pt path(s)
         # im = im.float()  # uint8 to fp16/32
         im = im.astype(np.float32) # uint8 to fp16/32
         im /= 255  # 0 - 255 to 0.0 - 1.0
-        print(im.shape)
+        #LOGGER.info(im.shape)
         if len(im.shape) == 3:
             im = im[None]  # expand for batch dim
-            print(f'im.shape = {im.shape}')
+            LOGGER.info(f'im.shape = {im.shape}')
         t2 = time_sync()
         dt[0] += t2 - t1
 
         # Inference
         visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
         # pred = model(im, augment=augment, visualize=visualize)
-        boxes = compiled_model([im])[output_layer_ir]
-        LOGGER.info(f'boxes={boxes}')
+        pred = compiled_model([im])[output_layer_ir]
+        pred = torch.from_numpy(pred)
+        LOGGER.info(f'pred={pred.shape}')
         t3 = time_sync()
         dt[1] += t3 - t2
 
@@ -228,7 +338,8 @@ def run(weights=ROOT / 'yolov3.pt',  # model.pt path(s)
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / 'yolov3.pt', help='model path(s)')
+    parser.add_argument('--originweights', type=str, default=ROOT / 'yolov3.pt', help='origin model')
+    parser.add_argument('--weights', type=str, default=ROOT / 'yolov3.pt', help='optimized model')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
